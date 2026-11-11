@@ -8,6 +8,7 @@ import contextlib
 from dataclasses import dataclass
 import importlib
 import io
+import os
 import time
 from types import MappingProxyType
 
@@ -303,6 +304,10 @@ class ProgramExecutor:
             "close_gripper",
             "go_home",
         }
+        if motion and name == "step" and os.environ.get("CAP_HARNESS_STEP_KEYFRAMES", "1") == "0":
+            # Per-tick control loops call step() hundreds of times; two PNGs per tick
+            # dominate the run time. Opt-in: steps are still in episode/steps.jsonl.
+            motion = False
         if motion:
             self._recorder.keyframe(f"before-{name}")  # type: ignore[attr-defined]
         with self._recorder.span(  # type: ignore[attr-defined]

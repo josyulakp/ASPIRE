@@ -75,8 +75,15 @@ YAM_REAL_PUBLIC_TOOL_NAMES = frozenset(
     {"yam_real.get_task_metadata", "yam_real.get_controller_metadata"}
 )
 
+INSERTION_PUBLIC_TOOL_NAMES = frozenset(
+    {"insertion.get_task_metadata", "insertion.get_controller_metadata", "insertion.get_wrench"}
+)
+"""Nonprivileged insertion metadata: nominal grasp, socket estimate, controller limits, and
+the wrist wrench (registered only when the adapter runs with INSERTION_FORCE=1)."""
+
 _APPROVED_EMBODIMENT_PREFIXES = (
     "behavior.",
+    "insertion.",
     "yam_real.",
     "libero.",
     "robosuite.",

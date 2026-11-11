@@ -141,7 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="execute and record one Code-as-Policy episode")
     run.add_argument(
         "--benchmark",
-        choices=("behavior", "libero-pro", "robosuite", "yam_real"),
+        choices=("behavior", "insertion", "libero-pro", "robosuite", "yam_real"),
         default="libero-pro",
     )
     run.add_argument("--suite", required=True)
@@ -204,7 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     batch.add_argument(
         "--benchmark",
-        choices=("libero-pro", "robosuite"),
+        choices=("insertion", "libero-pro", "robosuite"),
         default="libero-pro",
     )
     batch.add_argument("--suite", required=True)

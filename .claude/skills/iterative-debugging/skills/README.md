@@ -9,6 +9,7 @@ iterative-debugging campaigns. Pipeline orchestration belongs in the pipeline fi
 | [localize.md](localize.md) | SAM3 prompting, disambiguation, and 3D localization helpers |
 | [transport.md](transport.md) | Waypoints, collision-free transit, and placement approaches |
 | [manipulation.md](manipulation.md) | Drawers, knobs, switches, pushing, and other contact tasks |
+| [insertion.md](insertion.md) | Seating a held connector without force sensing: proprioceptive contact, hop search, admittance |
 
 All snippets use only the documented public CaP program APIs (`docs/api-reference.md`): no
 imports, no NumPy, no simulator internals, and a top-level `result` variable per program.

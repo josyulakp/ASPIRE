@@ -83,8 +83,10 @@ def run_program(
     allow_motion: bool = False,
 ) -> RunOutcome:
     """Run an episode, using its task horizon when max_steps is not supplied."""
-    if benchmark not in {"behavior", "libero-pro", "robosuite", "yam_real"}:
-        raise ValueError("benchmark must be behavior, libero-pro, robosuite, or yam_real")
+    if benchmark not in {"behavior", "insertion", "libero-pro", "robosuite", "yam_real"}:
+        raise ValueError(
+            "benchmark must be behavior, insertion, libero-pro, robosuite, or yam_real"
+        )
     if init_mode not in {"saved", "seeded"}:
         raise ValueError("init_mode must be 'saved' or 'seeded'")
     if init_mode != "saved" and benchmark != "libero-pro":
@@ -113,6 +115,15 @@ def run_program(
         metadata = registry.resolve(suite, task_id)
         adapter_type = BehaviorAdapter
         extension_allowlist = BEHAVIOR_PUBLIC_TOOL_NAMES
+    elif benchmark == "insertion":
+        from .insertion.adapter import InsertionAdapter
+        from .insertion.registry import InsertionTaskRegistry
+        from .registry import INSERTION_PUBLIC_TOOL_NAMES
+
+        registry = InsertionTaskRegistry()
+        metadata = registry.resolve(suite, task_id)
+        adapter_type = InsertionAdapter
+        extension_allowlist = INSERTION_PUBLIC_TOOL_NAMES
     elif benchmark == "yam_real":
         from .registry import YAM_REAL_PUBLIC_TOOL_NAMES
         from .yam_real.adapter import YamRealAdapter
@@ -143,6 +154,16 @@ def run_program(
             "ik": ("curobo",),
             "trajectory_planning": ("interpolation", "curobo"),
             "pose_planning": ("curobo-integrated",),
+        }
+    elif benchmark == "insertion":
+        # No perception or grasp services: the plug is pre-grasped and the socket
+        # estimate comes from insertion.get_task_metadata(). IK runs in-process.
+        provider_capabilities = {
+            "segmentation": None,
+            "grasping": (),
+            "ik": ("mujoco",),
+            "trajectory_planning": ("interpolation",),
+            "pose_planning": ("composed",),
         }
     else:
         provider_capabilities = {
@@ -298,7 +319,23 @@ def run_program(
             "sam3",
         )
         contact_graspnet = TracedProvider(ContactGraspNetProvider(), recorder, "contact_graspnet")
-        if benchmark == "behavior":
+        if benchmark == "insertion":
+            from .contracts import MotionStrategy
+
+            api = CapApi(
+                adapter,
+                ik_providers={
+                    "mujoco": TracedProvider(
+                        adapter.kinematics(),  # type: ignore[attr-defined]
+                        recorder,
+                        "mujoco_ik",
+                    )
+                },
+                default_camera="closeup",
+                default_motion_strategy=MotionStrategy(ik_solver="mujoco"),
+                recorder=recorder,
+            )
+        elif benchmark == "behavior":
             from .contracts import MotionStrategy
 
             planner = TracedProvider(adapter.planner(), recorder, "curobo")  # type: ignore[attr-defined]

@@ -140,6 +140,10 @@ def _stated_horizon(benchmark: str, suite: str, task_id: int) -> int:
             from cap_harness.robosuite.registry import RobosuiteTaskRegistry
 
             stated = RobosuiteTaskRegistry().resolve(suite, task_id).horizon
+        elif benchmark == "insertion":
+            from cap_harness.insertion.registry import InsertionTaskRegistry
+
+            stated = InsertionTaskRegistry().resolve(suite, task_id).horizon
         else:
             stated = None
     except ImportError as exc:
@@ -505,8 +509,10 @@ def main() -> int:
         args.init_mode = "seeded" if args.benchmark == "libero-pro" else "saved"
     if args.workers < 1:
         raise SystemExit("--workers must be at least 1")
-    if args.workers > 1 and args.benchmark not in {"libero-pro", "robosuite"}:
-        raise SystemExit("worker reuse only supports libero-pro and robosuite; use --workers 1")
+    if args.workers > 1 and args.benchmark not in {"insertion", "libero-pro", "robosuite"}:
+        raise SystemExit(
+            "worker reuse only supports insertion, libero-pro and robosuite; use --workers 1"
+        )
     if args.init_mode != "saved" and args.benchmark != "libero-pro":
         raise SystemExit(
             "init_mode 'seeded' is only supported for the libero-pro benchmark; "

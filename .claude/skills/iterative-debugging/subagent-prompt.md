@@ -189,6 +189,54 @@ Every command below is written with these five variables. Set them once, from th
 | `SERVICE_PORTS` | `8114 8115 8116` | `8114 8115 8116` (add `8118` for cuRobo programs) |
 | `RUN_ENV` | `LIBERO_CONFIG_PATH=$PWD/.libero MUJOCO_GL=egl PYOPENGL_PLATFORM=egl EGL_PLATFORM=device TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 MUJOCO_EGL_DEVICE_ID=$GPU` | `MUJOCO_GL=egl PYOPENGL_PLATFORM=egl EGL_PLATFORM=device MUJOCO_EGL_DEVICE_ID=$GPU` |
 
+### `insertion` profile
+
+Use this for the PR V4P1SR + chopsticks connector tasks. The guide is `docs/insertion.md`; read it first.
+
+| | `insertion` |
+|---|---|
+| `CAP_HARNESS` | `/home/ubuntu/insertion_skill/.venv-aspire/bin/cap-harness` |
+| `INIT_MODE` | `saved` (seeds are drawn by the adapter itself) |
+| Default seeds | development 101–110; unseen-check 111–115; held-out 1–50 |
+| `SERVICE_PORTS` | none. There are no perception services, so skip the port check. |
+| `RUN_ENV` | `MUJOCO_GL=egl PYOPENGL_PLATFORM=egl EGL_PLATFORM=device MUJOCO_EGL_DEVICE_ID=0 CAP_HARNESS_STEP_KEYFRAMES=0 INSERTION_CAMERA_REFRESH_TICKS=2` |
+| `RUN_FLAGS` | `--camera-width 480 --camera-height 360`. Append this to every `run-batch`/`run`, and use `--workers 3`. |
+| `MAX_STEPS` | 1200, the task's stated horizon (60 s at 20 Hz) |
+
+The campaign has one physical GPU (0), and every agent shares it for rendering. The simulator is CPU-bound, so
+"your GPU" below means your scheduling slot: always render on device 0, and keep to `--workers 3`. Prefix every
+command with `env $RUN_ENV` rather than with `CUDA_VISIBLE_DEVICES=$GPU MUJOCO_EGL_DEVICE_ID=$GPU`.
+
+**Insertion context:**
+
+- At t = 0 the robot already holds the plug above the socket. The gripper is locked: `set_gripper` returns
+  `unsupported`.
+- There is **no force/torque sensing** and no perception service. `localize_object`, `segment_text` and
+  `generate_grasps` will fail. The program sees:
+  - proprioception: joints, plus `end_effector_poses["primary"]`, the plug tip as the *nominal* grasp places it;
+  - `insertion.get_task_metadata()`: a perception-grade socket estimate, seated depth, plug bounds, and
+    uncertainty bounds;
+  - `insertion.get_controller_metadata()`: control rate and joint stiffness;
+  - RGB-D from the `closeup` and `overview` cameras.
+- Each seed hides errors in the grasp and in the socket estimate. `outcome.json`'s `task_success` is the only
+  success signal you get.
+- **Stage 0 replaces SAM3 exploration.** Instead, run one observation-only probe on the first development seed
+  that records `insertion.get_task_metadata()`, `insertion.get_controller_metadata()`, `get_robot_state()` and the
+  camera names into `result`. Look at the `closeup` keyframe. `task-exploration.md` and `scene_snapshot.py` assume
+  SAM3; skip them.
+
+**Insertion-specific FORBIDDEN** (on top of the general rules):
+
+- Reading the scene files (`insertion_skill/envs/*/scene.xml`, `manifest.json`) or `/home/ubuntu/insertion_assets`
+  for geometry.
+- Reading `src/cap_harness/insertion/` (it contains the success predicate and the perturbation draw), or
+  `insertion_skill/*.py`.
+- Setting `INSERTION_HOST_EVIDENCE`, `INSERTION_PERTURBATION` or `INSERTION_PERTURBATION_SCALE`. They expose
+  ground truth or change the task.
+- Reading anything under `/home/ubuntu/insertion_skill/aspire_insertion/`. It is an earlier, separate campaign,
+  and reading it voids your result.
+- Use `docs/insertion.md` and `docs/api-reference.md` for the contract.
+
 Use the coordinator's seed assignment from `campaign.json`, including when resuming an existing
 run; the defaults above do not replace its saved settings. For the launch commands below, set
 FIRST_DEV_SEED to the first entry in DEV_SEEDS. The commands expand RUN_ENV as space-separated

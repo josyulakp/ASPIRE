@@ -274,6 +274,10 @@ def _task_horizon(benchmark: str, suite: str, task_id: int) -> int:
         from cap_harness.robosuite.registry import RobosuiteTaskRegistry
 
         stated = RobosuiteTaskRegistry().resolve(suite, task_id).horizon
+    elif benchmark == "insertion":
+        from cap_harness.insertion.registry import InsertionTaskRegistry
+
+        stated = InsertionTaskRegistry().resolve(suite, task_id).horizon
     else:
         stated = None
     return int(stated) if stated else DEFAULT_MAX_STEPS
@@ -305,9 +309,9 @@ def run_seeds(
     Results stream to ``results_jsonl`` as they land, so an interrupted sweep
     leaves the seeds it finished on disk rather than nothing at all.
     """
-    if benchmark not in {"libero-pro", "robosuite"}:
+    if benchmark not in {"insertion", "libero-pro", "robosuite"}:
         raise ValueError(
-            f"run-batch does not accept {benchmark}: only libero-pro and robosuite "
+            f"run-batch does not accept {benchmark}: only insertion, libero-pro and robosuite "
             "support worker reuse. Use a fresh `cap-harness run` process for each episode."
         )
     if init_mode not in {"saved", "seeded"}:

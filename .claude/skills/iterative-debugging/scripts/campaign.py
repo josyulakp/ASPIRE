@@ -247,6 +247,7 @@ PUBLIC_TOOLS = (
     "libero",
     "robosuite",
     "robocasa",
+    "insertion",
 )
 #: Names the library itself establishes, so a snippet may use them bare: the two
 #: pure-Python helpers it ships and the two conventional bindings every snippet
