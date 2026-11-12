@@ -450,6 +450,16 @@ class InsertionAdapter:
         self._ee_id = int(np.atleast_1d(weld.obj1id)[0])
         plug_id = model.body("plug").id
         ee_from_plug = _transform(_quat_to_matrix(weld.data[6:10]), weld.data[3:6])
+        #: Friction-grasp scenes (insertion_skill desktop cell): the weld is inactive and the plug
+        #: is held by the jaws. Its keyframe holds the grasp after settling, a few mm off the
+        #: nominal one; treat that settled grasp as the calibrated grasp, and draw no in-hand
+        #: error on top of it (moving the plug inside closed jaws would make it penetrate them).
+        self._friction_grasp = bool(getattr(env, "friction_grasp", False))
+        if self._friction_grasp:
+            mujoco.mj_kinematics(model, data)
+            ee_from_plug = invert_transform(
+                _transform(data.xmat[self._ee_id], data.xpos[self._ee_id])
+            ) @ _transform(data.xmat[plug_id], data.xpos[plug_id])
         plug_from_tip = _transform(
             _quat_to_matrix(model.site_quat[env.tip]), model.site_pos[env.tip]
         )
@@ -487,6 +497,8 @@ class InsertionAdapter:
 
         start_offset = draw_start()
 
+        if self._friction_grasp:
+            in_hand = np.eye(4)  # drawn above anyway, so the seeded stream stays the same
         # Move the weld so the plug really sits off the nominal grasp.
         ee_from_plug_actual = self._ee_from_tip_nominal @ in_hand @ invert_transform(plug_from_tip)
         model.eq_data[self._weld_id, 3:6] = ee_from_plug_actual[:3, 3]
