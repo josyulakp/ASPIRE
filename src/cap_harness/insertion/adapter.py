@@ -362,7 +362,16 @@ class InsertionAdapter:
         #: Wrist force/torque (INSERTION_FORCE=1): insertion.get_wrench() and wrench(). Off by
         #: default, so programs see contact only as tracking error.
         self._ft = _WristForceSensor() if os.environ.get("INSERTION_FORCE", "0") == "1" else None
-        self.controller = "JOINT_IMPEDANCE"
+        #: Arm controller (INSERTION_CONTROLLER): "impedance" (default, soft joint PD), or a model of the real arm's
+        #: controllers, "admittance" (F/T admittance + diff-IK + velocity servo) or "position" (/right/pos_move);
+        #: see controller.py.
+        self.controller_mode = os.environ.get("INSERTION_CONTROLLER", "impedance")
+        self.controller = "JOINT_IMPEDANCE" if self.controller_mode == "impedance" else self.controller_mode.upper()
+        self._arm_controller = None
+        if self.controller_mode != "impedance":
+            from cap_harness.insertion.controller import ArmController
+
+            self._arm_controller = ArmController(self, self.controller_mode)
         self._run_observer = run_observer
         self._env: Any | None = None
         self._metadata: InsertionTaskMetadata | None = None
@@ -566,6 +575,8 @@ class InsertionAdapter:
             env.step(self._impedance_torque(self._joint_target))
         if self._ft is not None:
             self._ft.reset(self, seed)
+        if self._arm_controller is not None:
+            self._arm_controller.reset(seed)
 
         from insertion_skill.validate_envs import penetrations
 
@@ -664,8 +675,11 @@ class InsertionAdapter:
             target = np.clip(np.asarray(command.target, dtype=np.float64), limits[:, 0], limits[:, 1])
             self._joint_target = target
             substeps = max(1, int(round(self.control_period_s / env.model.opt.timestep)))
+            controller = self._arm_controller
+            if controller is not None:
+                controller.set_target(target, controller.kin._tip_world(target))
             for _ in range(substeps):
-                env.step(self._impedance_torque(target))
+                env.step(self._impedance_torque(target) if controller is None else controller.torque())
                 if self._ft is not None:
                     self._ft.sample()
             if not bool(np.all(np.isfinite(env.data.qpos))):
