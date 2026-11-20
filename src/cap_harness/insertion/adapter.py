@@ -1139,6 +1139,18 @@ class InsertionAdapter:
     def check_success(self) -> bool:
         return bool(self._require_env().seated())
 
+    def grip_slip_mm(self) -> list[float]:
+        """Host-only: true plug tip minus the calibrated (nominal) tip, in the nominal tip frame (mm).
+
+        +z means the plug was pushed back into the jaws; the program's tip estimate is then that far too deep.
+        """
+        env = self._require_env()
+        data = env.data
+        world_from_ee = _transform(data.xmat[self._ee_id], data.xpos[self._ee_id])
+        tip_world = data.site_xpos[env.tip]
+        nominal = world_from_ee @ self._ee_from_tip_nominal
+        return [round(float(v) * 1e3, 3) for v in nominal[:3, :3].T @ (tip_world - nominal[:3, 3])]
+
     def tip_error_in_target(self) -> list[float]:
         """Host-only: true plug-tip position in the seated-target frame (m)."""
         return [float(value) for value in self._require_env().tip_in_target()]

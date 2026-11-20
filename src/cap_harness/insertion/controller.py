@@ -53,9 +53,18 @@ DEFAULTS: dict[str, Any] = {
     # Admittance in the tip frame [x y z rx ry rz]; damping from the ratio unless given.
     "adm_mass": [5.0, 5.0, 5.0, 0.05, 0.05, 0.05],         # above the hand inertia the F/T sees
     "adm_stiffness": [500.0, 500.0, 1000.0, 2.0, 2.0, 0.5], # soft laterally so chamfers guide the plug
-    "adm_damping_ratio": 1.0,
+    "adm_damping_ratio": 10.0,                          # overdamped: lower values bounce on stiff contact (6 Hz
+                                                         # impacts at the grip friction limit, plug slips in the jaws)
     "adm_damping": None,
     "adm_max_offset": [0.03, 0.03, 0.03, 0.2, 0.2, 0.5],  # m, rad: the compliant offset saturates here
+    # Force limit (tip frame, N): above it the arm backs off along the force at force_limit_gain (m/s per N of
+    # excess), on top of the admittance, at the inner-loop rate (the admittance's M is too slow for impacts).
+    # The setpoint is also kept within force_limit / K of the measured tip, so the steady force stays under the
+    # limit and the offset never saturates into stiff pushing. None disables. Above force_abort (N, |F|) the
+    # controller latches a stop: it holds the measured tip backed off 2 mm along +z (the real stack's watchdog).
+    "force_limit": [15.0, 15.0, 25.0],
+    "force_limit_gain": 0.004,
+    "force_abort": 60.0,
     "ft_lowpass_hz": 30.0,                               # the controller's own F/T filter
     "ft_deadband": [0.3, 0.3, 0.3, 0.005, 0.005, 0.005], # N, N m: below this the admittance ignores the wrench
     # Pose tracking and diff-IK.
@@ -153,6 +162,12 @@ class ArmController:
         self.v_max, self.w_max = float(p["v_max"]), float(p["w_max"])
         self.lam2 = float(p["dls_lambda"]) ** 2
         self.position_qd_max = float(p["position_qd_max"])
+        self.force_limit = None if p["force_limit"] is None else np.asarray(p["force_limit"], dtype=np.float64)
+        self.force_gain = float(p["force_limit_gain"])
+        self.force_abort = None if p["force_abort"] is None else float(p["force_abort"])
+        self.aborted_at: float | None = None
+        self.peak_force = 0.0
+        self.capped_cycles = 0
         self.params = p
         self.limits = adapter._joint_limits()
         self.kin = adapter.kinematics()
@@ -201,13 +216,34 @@ class ArmController:
         sensor = self.sensor
         return sensor._to_tip(sensor._contact_sample())
 
-    def _reference(self) -> np.ndarray:
+    def _reference(self, setpoint: np.ndarray) -> np.ndarray:
         """Setpoint displaced by the compliant offset, offset expressed in the setpoint's tip frame."""
-        reference = self.setpoint.copy()
-        rotation = self.setpoint[:3, :3]
-        reference[:3, 3] = self.setpoint[:3, 3] + rotation @ self.offset[:3]
+        reference = setpoint.copy()
+        rotation = setpoint[:3, :3]
+        reference[:3, 3] = setpoint[:3, 3] + rotation @ self.offset[:3]
         reference[:3, :3] = rotation @ _exp(self.offset[3:])
         return reference
+
+    def _safe_setpoint(self, tip: np.ndarray) -> np.ndarray:
+        """The setpoint after the force cap and the abort latch."""
+        setpoint = self.setpoint.copy()
+        rotation = setpoint[:3, :3]
+        force = float(np.linalg.norm(self.wrench[:3]))
+        self.peak_force = max(self.peak_force, force)
+        if self.aborted_at is None and self.force_abort is not None and force > self.force_abort:
+            self.aborted_at = float(self.data.time)
+            self.abort_pose = tip.copy()
+            self.abort_pose[:3, 3] += tip[:3, :3] @ np.array([0.0, 0.0, 0.002])
+        if self.aborted_at is not None:
+            return self.abort_pose.copy()
+        if self.force_limit is not None:
+            lead = rotation.T @ (setpoint[:3, 3] - tip[:3, 3])
+            cap = self.force_limit / self.stiff[:3]
+            clipped = np.clip(lead, -cap, cap)
+            if np.any(clipped != lead):
+                self.capped_cycles += 1
+                setpoint[:3, 3] = tip[:3, 3] + rotation @ clipped
+        return setpoint
 
     def _inner(self) -> None:
         """One diff-IK / admittance cycle: update the joint velocity command."""
@@ -217,7 +253,8 @@ class ArmController:
             # The wrench is in the current tip frame; express it in the setpoint frame (they differ by the offset).
             w_tip = self.wrench.copy()
             w_tip = np.where(np.abs(w_tip) > self.deadband, w_tip - np.sign(w_tip) * self.deadband, 0.0)
-            setpoint_from_tip = self.setpoint[:3, :3].T @ tip[:3, :3]
+            setpoint = self._safe_setpoint(tip)
+            setpoint_from_tip = setpoint[:3, :3].T @ tip[:3, :3]
             force = np.r_[setpoint_from_tip @ w_tip[:3], setpoint_from_tip @ w_tip[3:]]
             accel = (force - self.damp * self.offset_rate - self.stiff * self.offset) / self.mass
             self.offset_rate = self.offset_rate + accel * dt
@@ -225,9 +262,9 @@ class ArmController:
             clipped = np.clip(self.offset, -self.max_offset, self.max_offset)
             self.offset_rate = np.where(clipped != self.offset, 0.0, self.offset_rate)
             self.offset = clipped
-            reference = self._reference()
+            reference = self._reference(setpoint)
             # Feed-forward of the admittance's own motion (setpoint steps arrive at 20 Hz; tracking handles them).
-            rotation = self.setpoint[:3, :3]
+            rotation = setpoint[:3, :3]
             ff = np.r_[rotation @ self.offset_rate[:3], rotation @ self.offset_rate[3:]]
             error = np.r_[reference[:3, 3] - tip[:3, 3], _rotvec(reference[:3, :3] @ tip[:3, :3].T)]
             twist = ff + self.track * error
@@ -236,6 +273,12 @@ class ArmController:
                 twist[:3] *= self.v_max / speed
             if spin > self.w_max:
                 twist[3:] *= self.w_max / spin
+            if self.force_limit is not None and self.aborted_at is None:
+                excess = np.sign(force[:3]) * np.maximum(np.abs(force[:3]) - self.force_limit, 0.0)
+                if np.any(excess != 0.0):
+                    self.capped_cycles += 1
+                    back = np.clip(self.force_gain * excess, -2 * self.v_max, 2 * self.v_max)
+                    twist[:3] += rotation @ back
             jac = self.tip_jacobian_world(tip)
             qd_cmd = jac.T @ np.linalg.solve(jac @ jac.T + self.lam2 * np.eye(6), twist)
         else:
@@ -276,4 +319,5 @@ class ArmController:
                 "episode": {"delay_ticks": self.delay_ticks, "inner_dt_s": self.dt_in, "lag_s": self.lag,
                             "adm_stiffness": self.stiff.tolist(), "adm_mass": self.mass.tolist(),
                             "adm_damping": self.damp.tolist(), "servo_kp": self.kp.tolist(),
-                            "servo_kd": self.kd.tolist()}}
+                            "servo_kd": self.kd.tolist(), "peak_force_n": round(self.peak_force, 2),
+                            "force_capped_cycles": self.capped_cycles, "aborted_at_s": self.aborted_at}}
