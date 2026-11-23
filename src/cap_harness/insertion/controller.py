@@ -72,6 +72,9 @@ DEFAULTS: dict[str, Any] = {
     "v_max": 0.05,                                       # m/s
     "w_max": 0.5,                                        # rad/s
     "dls_lambda": 0.02,
+    # Feed-forward of the program's own setpoint velocity (finite difference of consecutive 20 Hz setpoints), so a
+    # low track_gain (needed with a long command delay) does not make the tip trail moving commands. 0 = off.
+    "setpoint_ff": 0.0,
     # /right/pos_move model: the target is approached at this joint speed, then held by the stiff servo.
     "position_qd_max": 0.5,
     # Per-episode domain randomisation: multiplicative +-randomize on delay, lag, servo gains, admittance K and M.
@@ -162,6 +165,9 @@ class ArmController:
         self.v_max, self.w_max = float(p["v_max"]), float(p["w_max"])
         self.lam2 = float(p["dls_lambda"]) ** 2
         self.position_qd_max = float(p["position_qd_max"])
+        self.setpoint_ff = float(p["setpoint_ff"])
+        self.setpoint_vel = np.zeros(6)
+        self.period = float(adapter.control_period_s)
         self.force_limit = None if p["force_limit"] is None else np.asarray(p["force_limit"], dtype=np.float64)
         self.force_gain = float(p["force_limit_gain"])
         self.force_abort = None if p["force_abort"] is None else float(p["force_abort"])
@@ -210,7 +216,10 @@ class ArmController:
     def set_target(self, joint_target: np.ndarray, setpoint_world: np.ndarray) -> None:
         """New control period: the commanded joint target and its tip pose (FK through the nominal grasp)."""
         self.joint_target = np.asarray(joint_target, dtype=np.float64).copy()
-        self.setpoint = np.asarray(setpoint_world, dtype=np.float64).copy()
+        new = np.asarray(setpoint_world, dtype=np.float64).copy()
+        self.setpoint_vel = np.r_[new[:3, 3] - self.setpoint[:3, 3],
+                                  _rotvec(new[:3, :3] @ self.setpoint[:3, :3].T)] / self.period
+        self.setpoint = new
 
     def _contact_wrench_tip(self) -> np.ndarray:
         sensor = self.sensor
@@ -267,7 +276,7 @@ class ArmController:
             rotation = setpoint[:3, :3]
             ff = np.r_[rotation @ self.offset_rate[:3], rotation @ self.offset_rate[3:]]
             error = np.r_[reference[:3, 3] - tip[:3, 3], _rotvec(reference[:3, :3] @ tip[:3, :3].T)]
-            twist = ff + self.track * error
+            twist = ff + self.track * error + self.setpoint_ff * self.setpoint_vel
             speed, spin = np.linalg.norm(twist[:3]), np.linalg.norm(twist[3:])
             if speed > self.v_max:
                 twist[:3] *= self.v_max / speed
