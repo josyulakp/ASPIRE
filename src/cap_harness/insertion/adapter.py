@@ -421,6 +421,37 @@ class InsertionAdapter:
         """Host-only record of this episode's hidden perturbations, for analysis."""
         return MappingProxyType(dict(self._episode_record))
 
+    def _apply_socket_resistance(self) -> None:
+        """INSERTION_SOCKET_RESIST="F_N,zone_m[,v0_m_s]": contact-spring friction of a real socket (sim sockets are
+        nearly free). Within zone_m above the seat the plug feels a regularised Coulomb force of up to F_N along the
+        socket axis, opposing its axial motion: F = -F_N tanh(v / v0) (default v0 1 mm/s), so insertion and
+        extraction both need about F_N. Applied at the plug tip through qfrc_applied, so the wrist F/T sees it.
+        """
+        spec = getattr(self, "_socket_resist", None)
+        if spec is None:
+            raw = os.environ.get("INSERTION_SOCKET_RESIST")
+            spec = tuple(float(v) for v in raw.split(",")) if raw else ()
+            self._socket_resist = spec
+        if not spec:
+            return
+        import mujoco
+
+        env = self._env
+        model, data = env.model, env.data
+        force_n, zone = spec[0], spec[1]
+        v0 = spec[2] if len(spec) > 2 else 0.001
+        data.qfrc_applied[:] = 0.0
+        axis = data.site_xmat[env.target].reshape(3, 3)[:, 2]
+        z = float(axis @ (data.site_xpos[env.tip] - data.site_xpos[env.target]))
+        if z > zone:
+            return
+        plug = self._plug_body_id
+        jac = np.zeros((3, model.nv))
+        mujoco.mj_jac(model, data, jac, None, data.site_xpos[env.tip], plug)
+        v = float(axis @ (jac @ data.qvel))
+        force = -force_n * math.tanh(v / v0) * axis
+        mujoco.mj_applyFT(model, data, force, np.zeros(3), data.site_xpos[env.tip], plug, data.qfrc_applied)
+
     def _require_env(self) -> Any:
         if self._env is None:
             raise RuntimeError("reset() must be called before using the insertion adapter")
@@ -458,6 +489,7 @@ class InsertionAdapter:
         self._weld_id = int(np.atleast_1d(weld.id)[0])
         self._ee_id = int(np.atleast_1d(weld.obj1id)[0])
         plug_id = model.body("plug").id
+        self._plug_body_id = plug_id
         ee_from_plug = _transform(_quat_to_matrix(weld.data[6:10]), weld.data[3:6])
         #: Friction-grasp scenes (insertion_skill desktop cell): the weld is inactive and the plug
         #: is held by the jaws. Its keyframe holds the grasp after settling, a few mm off the
@@ -627,6 +659,7 @@ class InsertionAdapter:
         env = self._require_env()
         model, data = env.model, env.data
         plug_id = model.body("plug").id
+        self._plug_body_id = plug_id
         pairs = []
         for contact in data.contact[: data.ncon]:
             bodies = (model.geom_bodyid[contact.geom1], model.geom_bodyid[contact.geom2])
@@ -679,6 +712,7 @@ class InsertionAdapter:
             if controller is not None:
                 controller.set_target(target, controller.kin._tip_world(target))
             for _ in range(substeps):
+                self._apply_socket_resistance()
                 env.step(self._impedance_torque(target) if controller is None else controller.torque())
                 if self._ft is not None:
                     self._ft.sample()
@@ -952,6 +986,7 @@ class InsertionAdapter:
         env = self._require_env()
         model = env.model
         plug_id = model.body("plug").id
+        self._plug_body_id = plug_id
         plug_from_tip = _transform(_quat_to_matrix(model.site_quat[env.tip]), model.site_pos[env.tip])
         tip_from_plug = invert_transform(plug_from_tip)
         points = []
