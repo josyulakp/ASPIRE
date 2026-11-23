@@ -50,6 +50,12 @@ DEFAULTS: dict[str, Any] = {
     "velocity_gain": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
     "velocity_ripple": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     "ripple_hz": 3.0,
+    # Speed-independent part (real arm, 0.02 rad/s steps: j1/j2 keep ~0.02 rad/s half-amplitude, stick-slip-like):
+    # amplitude = max(velocity_ripple * |v|, velocity_ripple_abs) while |v| > ripple_min_speed, else
+    # velocity_noise_still (std, rad/s, measured with a zero command).
+    "velocity_ripple_abs": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    "ripple_min_speed": 0.005,
+    "velocity_noise_still": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     # Servo stiffness as a bandwidth: kp = I w^2, kd = 2 zeta I w per joint, from the joint-space inertia at reset
     # (gains above ~0.3 / timestep for the damping chatter at the 0.5 ms step). servo_kp / servo_kd override.
     "servo_bandwidth_hz": 30.0,
@@ -71,6 +77,9 @@ DEFAULTS: dict[str, Any] = {
     "force_limit": [15.0, 15.0, 25.0],
     "force_limit_gain": 0.004,
     "force_abort": 60.0,
+    # What the latched abort does: "backoff" servos to the measured tip 2 mm back along +z; "stop" commands zero
+    # joint velocity from then on (no servoing, so joint ripple cannot keep pushing the seated plug).
+    "abort_mode": "backoff",
     "ft_lowpass_hz": 30.0,                               # the controller's own F/T filter
     "ft_deadband": [0.3, 0.3, 0.3, 0.005, 0.005, 0.005], # N, N m: below this the admittance ignores the wrench
     # Pose tracking and diff-IK.
@@ -157,6 +166,9 @@ class ArmController:
         self.qdd_max = float(p["qdd_max"])
         self.velocity_gain = np.asarray(p["velocity_gain"], dtype=np.float64)
         self.ripple = np.asarray(p["velocity_ripple"], dtype=np.float64)
+        self.ripple_abs = np.asarray(p["velocity_ripple_abs"], dtype=np.float64)
+        self.ripple_vmin = float(p["ripple_min_speed"])
+        self.noise_still = np.asarray(p["velocity_noise_still"], dtype=np.float64)
         self.ripple_theta = 2.0 * math.pi * float(p["ripple_hz"])
         self.ripple_state = np.zeros(6)
         self.ripple_rng = np.random.default_rng([seed, 0x51])
@@ -187,6 +199,7 @@ class ArmController:
         self.force_limit = None if p["force_limit"] is None else np.asarray(p["force_limit"], dtype=np.float64)
         self.force_gain = float(p["force_limit_gain"])
         self.force_abort = None if p["force_abort"] is None else float(p["force_abort"])
+        self.abort_mode = str(p["abort_mode"])
         self.aborted_at: float | None = None
         self.peak_force = 0.0
         self.capped_cycles = 0
@@ -310,6 +323,8 @@ class ArmController:
                     twist[:3] += rotation @ back
             jac = self.tip_jacobian_world(tip)
             qd_cmd = jac.T @ np.linalg.solve(jac @ jac.T + self.lam2 * np.eye(6), twist)
+            if self.aborted_at is not None and self.abort_mode == "stop":
+                qd_cmd = np.zeros(6)
         else:
             # pos_move: the (delayed) joint target is approached at a capped joint speed, then held; the servo's own
             # position loop closes this, so no velocity lag applies.
@@ -328,11 +343,15 @@ class ArmController:
         lagged = self.qd_lagged + alpha * (delayed - self.qd_lagged)
         lagged = self.qd_lagged + np.clip(lagged - self.qd_lagged, -self.qdd_max * dt, self.qdd_max * dt)
         self.qd_lagged = lagged
-        if np.any(self.ripple > 0) or np.any(self.velocity_gain != 1.0):
-            # OU noise with unit stationary std, scaled per joint; applied to the executed velocity only.
+        if (np.any(self.ripple > 0) or np.any(self.ripple_abs > 0) or np.any(self.noise_still > 0)
+                or np.any(self.velocity_gain != 1.0)):
+            # OU noise with unit stationary std; half-amplitude ~ 2 sigma. Applied to the executed velocity only.
             th = self.ripple_theta
             self.ripple_state += -th * self.ripple_state * dt + math.sqrt(2.0 * th * dt) * self.ripple_rng.standard_normal(6)
-            self.qd_exec = lagged * self.velocity_gain * (1.0 + 0.5 * self.ripple * self.ripple_state)
+            speed = np.abs(lagged)
+            amp = np.where(speed > self.ripple_vmin, 0.5 * np.maximum(self.ripple * speed, self.ripple_abs),
+                           self.noise_still)
+            self.qd_exec = lagged * self.velocity_gain + amp * self.ripple_state
         else:
             self.qd_exec = lagged
 
