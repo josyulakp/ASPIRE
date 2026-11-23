@@ -44,6 +44,12 @@ DEFAULTS: dict[str, Any] = {
     "lag_s": 0.02,
     "qd_max": [1.0, 1.0, 2.0, 2.0, 2.0, 2.0],            # URDF velocity limits (rad/s), arm joints 1 2 3 4 6 7
     "qdd_max": 10.0,                                     # rad/s^2
+    # Measured joint velocity errors (real arm, 2026-11-23, +-0.1 rad/s steps): steady-state gain per joint and a
+    # multiplicative ripple, modelled as Ornstein-Uhlenbeck noise (std = ripple / 2, so +-ripple is ~2 sigma) with
+    # bandwidth ripple_hz. Arm joints 1 2 3 4 6 7. Defaults: ideal (gain 1, no ripple).
+    "velocity_gain": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    "velocity_ripple": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    "ripple_hz": 3.0,
     # Servo stiffness as a bandwidth: kp = I w^2, kd = 2 zeta I w per joint, from the joint-space inertia at reset
     # (gains above ~0.3 / timestep for the damping chatter at the 0.5 ms step). servo_kp / servo_kd override.
     "servo_bandwidth_hz": 30.0,
@@ -75,6 +81,10 @@ DEFAULTS: dict[str, Any] = {
     # Feed-forward of the program's own setpoint velocity (finite difference of consecutive 20 Hz setpoints), so a
     # low track_gain (needed with a long command delay) does not make the tip trail moving commands. 0 = off.
     "setpoint_ff": 0.0,
+    # Contact fade of that feed-forward (N): it scales linearly from 1 at |F| = 1 N to 0 at this force, so the arm
+    # stops pushing at the program's speed once it touches (with heavy admittance damping the yield force is D v).
+    # None = no fade.
+    "setpoint_ff_fade_n": None,
     # /right/pos_move model: the target is approached at this joint speed, then held by the stiff servo.
     "position_qd_max": 0.5,
     # Per-episode domain randomisation: multiplicative +-randomize on delay, lag, servo gains, admittance K and M.
@@ -145,6 +155,11 @@ class ArmController:
         self.lag = float(jitter(p["lag_s"]))
         self.qd_max = np.asarray(p["qd_max"], dtype=np.float64)
         self.qdd_max = float(p["qdd_max"])
+        self.velocity_gain = np.asarray(p["velocity_gain"], dtype=np.float64)
+        self.ripple = np.asarray(p["velocity_ripple"], dtype=np.float64)
+        self.ripple_theta = 2.0 * math.pi * float(p["ripple_hz"])
+        self.ripple_state = np.zeros(6)
+        self.ripple_rng = np.random.default_rng([seed, 0x51])
         full = np.zeros((self.model.nv, self.model.nv))
         mujoco.mj_fullM(self.model, self.data, full)
         inertia = np.diag(full)[env.vadr]
@@ -166,6 +181,7 @@ class ArmController:
         self.lam2 = float(p["dls_lambda"]) ** 2
         self.position_qd_max = float(p["position_qd_max"])
         self.setpoint_ff = float(p["setpoint_ff"])
+        self.ff_fade = None if p["setpoint_ff_fade_n"] is None else float(p["setpoint_ff_fade_n"])
         self.setpoint_vel = np.zeros(6)
         self.period = float(adapter.control_period_s)
         self.force_limit = None if p["force_limit"] is None else np.asarray(p["force_limit"], dtype=np.float64)
@@ -185,6 +201,7 @@ class ArmController:
         self.q_ref = env.q.copy()
         self.qd_ref = np.zeros(6)
         self.qd_lagged = np.zeros(6)
+        self.qd_exec = np.zeros(6)
         fill = env.q.copy() if self.mode == "position" else np.zeros(6)
         self.queue: deque[np.ndarray] = deque([fill.copy() for _ in range(self.delay_ticks)])
         self.offset = np.zeros(6)          # compliant offset e (tip-setpoint frame)
@@ -276,7 +293,10 @@ class ArmController:
             rotation = setpoint[:3, :3]
             ff = np.r_[rotation @ self.offset_rate[:3], rotation @ self.offset_rate[3:]]
             error = np.r_[reference[:3, 3] - tip[:3, 3], _rotvec(reference[:3, :3] @ tip[:3, :3].T)]
-            twist = ff + self.track * error + self.setpoint_ff * self.setpoint_vel
+            ff_gain = self.setpoint_ff
+            if self.ff_fade is not None:
+                ff_gain *= float(np.clip((self.ff_fade - np.linalg.norm(force[:3])) / max(self.ff_fade - 1.0, 1e-6), 0.0, 1.0))
+            twist = ff + self.track * error + ff_gain * self.setpoint_vel
             speed, spin = np.linalg.norm(twist[:3]), np.linalg.norm(twist[3:])
             if speed > self.v_max:
                 twist[:3] *= self.v_max / speed
@@ -308,6 +328,13 @@ class ArmController:
         lagged = self.qd_lagged + alpha * (delayed - self.qd_lagged)
         lagged = self.qd_lagged + np.clip(lagged - self.qd_lagged, -self.qdd_max * dt, self.qdd_max * dt)
         self.qd_lagged = lagged
+        if np.any(self.ripple > 0) or np.any(self.velocity_gain != 1.0):
+            # OU noise with unit stationary std, scaled per joint; applied to the executed velocity only.
+            th = self.ripple_theta
+            self.ripple_state += -th * self.ripple_state * dt + math.sqrt(2.0 * th * dt) * self.ripple_rng.standard_normal(6)
+            self.qd_exec = lagged * self.velocity_gain * (1.0 + 0.5 * self.ripple * self.ripple_state)
+        else:
+            self.qd_exec = lagged
 
     def torque(self) -> np.ndarray:
         """Arm torques for the next simulator substep."""
@@ -315,7 +342,7 @@ class ArmController:
         if self.substep % self.every == 0:
             self._inner()
         self.substep += 1
-        qd = self.qd_lagged
+        qd = self.qd_exec if self.mode == "admittance" else self.qd_lagged
         self.q_ref = self.q_ref + qd * self.dt
         at_limit = (self.q_ref <= self.limits[:, 0]) | (self.q_ref >= self.limits[:, 1])
         self.q_ref = np.clip(self.q_ref, self.limits[:, 0], self.limits[:, 1])
